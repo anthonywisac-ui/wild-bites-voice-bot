@@ -5,11 +5,7 @@ WhatsApp Business Calling API voice bot using:
 - Pipecat (orchestration)
 - Deepgram (STT + TTS)
 - Groq llama-3.1-8b-instant (LLM)
-- SmallWebRTCTransport (Meta WhatsApp leg)
-
-When a customer calls the Meta test number on WhatsApp,
-this bot answers, takes their order via voice, and hands off
-to the restaurant-bot for order confirmation + manager notification.
+- SmallWebRTCTransport with TURN fallback (for Railway NAT)
 """
 
 import os
@@ -20,11 +16,13 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from loguru import logger
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 import uvicorn
 
-# ── Pipecat imports ──────────────────────────────────────────
+from aiortc import RTCIceServer
+
+# ── Pipecat imports (new non-deprecated paths) ─────────────
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -34,8 +32,8 @@ from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.services.groq.llm import GroqLLMService
 from pipecat.transports.base_transport import TransportParams
-from pipecat.transports.network.small_webrtc import SmallWebRTCTransport
-from pipecat.transports.network.webrtc_connection import SmallWebRTCConnection
+from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.whatsapp.api import WhatsAppWebhookRequest
 from pipecat.transports.whatsapp.client import WhatsAppClient
 
@@ -51,12 +49,11 @@ WHATSAPP_WEBHOOK_VERIFICATION_TOKEN = os.getenv("WHATSAPP_WEBHOOK_VERIFICATION_T
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
-RESTAURANT_BOT_URL = os.getenv(
-    "RESTAURANT_BOT_URL",
-    "https://restaurant-bot-production-a133.up.railway.app/webhook",
-)
+# Optional user-provided TURN (Metered/Twilio/Cloudflare)
+TURN_USERNAME = os.getenv("TURN_USERNAME", "")
+TURN_CREDENTIAL = os.getenv("TURN_CREDENTIAL", "")
+TURN_URL = os.getenv("TURN_URL", "")
 
-# Basic sanity checks on startup (fail loud, not silent)
 missing = [k for k, v in {
     "WHATSAPP_TOKEN": WHATSAPP_TOKEN,
     "WHATSAPP_PHONE_NUMBER_ID": WHATSAPP_PHONE_NUMBER_ID,
@@ -72,8 +69,37 @@ logger.remove()
 logger.add(sys.stdout, level="INFO")
 
 
-# ── Wild Bites menu knowledge for the voice AI ──────────────
-# Mirrors what the restaurant-bot has, but simplified for voice.
+# ── ICE Servers: STUN + TURN fallback for Railway NAT ───────
+def build_ice_servers():
+    servers = [
+        RTCIceServer(urls="stun:stun.l.google.com:19302"),
+        RTCIceServer(urls="stun:stun.cloudflare.com:3478"),
+        RTCIceServer(urls="stun:stun1.l.google.com:19302"),
+    ]
+
+    if TURN_URL and TURN_USERNAME and TURN_CREDENTIAL:
+        servers.append(RTCIceServer(
+            urls=TURN_URL,
+            username=TURN_USERNAME,
+            credential=TURN_CREDENTIAL,
+        ))
+        logger.info(f"Using user-provided TURN: {TURN_URL}")
+    else:
+        # Free public fallback — FreeStun
+        servers.append(RTCIceServer(
+            urls="turn:freestun.net:3478",
+            username="free",
+            credential="free",
+        ))
+        logger.info("Using free public TURN (freestun.net). Set TURN_URL env var for production.")
+
+    return servers
+
+
+ICE_SERVERS = build_ice_servers()
+
+
+# ── Wild Bites menu ─────────────────────────────────────────
 MENU_FOR_VOICE = """
 You are Alex, the friendly voice assistant for Wild Bites Restaurant.
 You take orders over the phone via WhatsApp calling.
@@ -104,31 +130,27 @@ YOUR PERSONALITY:
 - Suggest popular items if customer is unsure
 
 CALL FLOW:
-1. Greet warmly: "Hi! Thanks for calling Wild Bites. I'm Alex. What can I get started for you?"
-2. Take their order one item at a time. Confirm each item briefly.
-3. Suggest ONE upsell max (e.g., "Want to add fries or a drink?")
+1. Greet: "Hi! Thanks for calling Wild Bites. I'm Alex. What can I get started for you?"
+2. Take order one item at a time. Confirm briefly.
+3. Suggest ONE upsell max (e.g., "Want fries or a drink?")
 4. Ask: delivery or pickup?
-5. If delivery: get address. If pickup: confirm pickup time (~25 min).
-6. Get their name.
-7. Ask for payment preference (cash or card-on-delivery).
-8. Repeat the full order + total + ETA before confirming.
-9. End with: "Your order is confirmed! You'll get a WhatsApp message shortly. Thanks for choosing Wild Bites!"
+5. If delivery: get address. If pickup: confirm ~25 min.
+6. Get caller's name.
+7. Ask payment: cash or card-on-delivery.
+8. Repeat order + total + ETA before confirming.
+9. End: "Your order is confirmed! You'll get a WhatsApp message shortly. Thanks!"
 
 IMPORTANT:
 - Keep every response SHORT (under 25 words). This is spoken aloud.
-- Do not use markdown, emojis, or special formatting — you are speaking.
-- If the caller asks something off-topic, politely redirect to ordering.
-- If the caller is unclear, ask ONE clarifying question.
-- Do not invent menu items — only use what's listed above.
+- No markdown, emojis, or special formatting — you are speaking.
+- If off-topic, politely redirect to ordering.
+- If unclear, ask ONE clarifying question.
+- Do not invent menu items — only what's listed above.
 """
 
 
 # ── Pipecat bot runner per call ──────────────────────────────
 async def run_bot(webrtc_connection: SmallWebRTCConnection):
-    """
-    Called once per incoming WhatsApp voice call.
-    Builds the pipeline: STT -> LLM -> TTS and runs until the call ends.
-    """
     logger.info(f"Starting voice bot for call: {webrtc_connection.pc_id}")
 
     transport = SmallWebRTCTransport(
@@ -179,8 +201,7 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection):
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
-        logger.info(f"Caller connected — greeting them")
-        # Seed the first bot turn so caller hears greeting immediately
+        logger.info("Caller connected — greeting them")
         messages.append({
             "role": "system",
             "content": "Greet the caller warmly and ask what they'd like to order.",
@@ -214,8 +235,9 @@ async def lifespan(app: FastAPI):
         phone_number_id=WHATSAPP_PHONE_NUMBER_ID,
         session=http_session,
         whatsapp_secret=WHATSAPP_APP_SECRET,
+        ice_servers=ICE_SERVERS,
     )
-    logger.info("Voice bot ready. Waiting for WhatsApp calls...")
+    logger.info(f"Voice bot ready. Waiting for WhatsApp calls... (ICE servers: {len(ICE_SERVERS)})")
     yield
     if whatsapp_client:
         await whatsapp_client.terminate_all_calls()
@@ -233,9 +255,6 @@ async def root():
 
 @app.get("/whatsapp")
 async def verify_whatsapp_webhook(request: Request):
-    """
-    Meta webhook verification (GET) — happens once when you save the webhook URL.
-    """
     params = dict(request.query_params)
     if whatsapp_client is None:
         return PlainTextResponse("Not ready", status_code=503)
@@ -252,11 +271,6 @@ async def verify_whatsapp_webhook(request: Request):
 
 @app.post("/whatsapp")
 async def whatsapp_webhook(request: Request):
-    """
-    Meta calls webhook (POST).
-    - 'connect' event: caller is dialing us -> spin up Pipecat bot + answer
-    - 'terminate' event: caller hung up -> clean up
-    """
     raw_body = await request.body()
     sha256_signature = request.headers.get("x-hub-signature-256", "")
 
@@ -266,7 +280,6 @@ async def whatsapp_webhook(request: Request):
         logger.error(f"Invalid JSON from Meta: {e}")
         return JSONResponse({"status": "bad_request"}, status_code=400)
 
-    # Log non-call events (so messages-only webhooks don't crash)
     try:
         entry = body_json.get("entry", [{}])[0]
         changes = entry.get("changes", [{}])[0]
@@ -277,7 +290,6 @@ async def whatsapp_webhook(request: Request):
     except Exception:
         pass
 
-    # Parse into Pipecat's typed webhook request
     try:
         webhook_request = WhatsAppWebhookRequest.model_validate(body_json)
     except Exception as e:
@@ -287,8 +299,6 @@ async def whatsapp_webhook(request: Request):
     if whatsapp_client is None:
         return JSONResponse({"status": "not_ready"}, status_code=503)
 
-    # Pipecat handles the SDP handshake + pre-accept + accept + WebRTC setup.
-    # `run_bot` is our callback — called after the WebRTC peer is ready.
     try:
         handled = await whatsapp_client.handle_webhook_request(
             request=webhook_request,

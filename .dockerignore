@@ -1,0 +1,16 @@
+.git
+.gitignore
+.env
+.venv
+venv
+__pycache__
+*.pyc
+.DS_Store
+.idea
+.vscode
+README.md
+.env.example
+Procfile
+nixpacks.toml
+runtime.txt
+.python-version
